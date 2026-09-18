@@ -32,9 +32,10 @@ func NewClient(hub *Hub, conn *websocket.Conn, roomID, username string) *Client 
 		ClientID: uuid.New().String(),
 		Username: username,
 		Color:    randomColor(),
-		Position: 0,
+		position: 0,
 		Conn:     conn,
 		Send:     make(chan []byte, 256),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -70,7 +71,7 @@ func (c *Client) ReadPump(opHandler func(*Client, Message)) {
 		msg.ClientID = c.ClientID
 
 		switch msg.Type {
-		case MsgOp, MsgCursorMove, MsgSnapshot:
+		case MsgOp, MsgCursorMove, MsgSnapshot, MsgFollow, MsgUnfollow:
 			// 交给handler处理
 			if opHandler != nil {
 				opHandler(c, msg)
@@ -91,28 +92,17 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
-		case message, ok := <-c.Send:
+		case <-c.done:
+			// Hub 已注销该连接，通知对端关闭
+			c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
+		case message := <-c.Send:
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// hub closed channel
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
 
-			w, err := c.Conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
-
-			// 批量发送待处理消息
-			n := len(c.Send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.Send)
-			}
-
-			if err := w.Close(); err != nil {
+			// 每条消息一个独立文本帧。
+			// 不能把多条消息用 '\n' 拼进同一帧：客户端按单条 JSON 解析，
+			// 拼接帧会导致 unmarshal 失败、整条消息丢失。
+			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 
@@ -134,6 +124,8 @@ func (c *Client) SendMessage(msg Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	select {
+	case <-c.done:
+		return ErrConnectionClosed
 	case c.Send <- data:
 		return nil
 	default:

@@ -35,11 +35,11 @@ type Server struct {
 
 // DocState 文档的运行时状态
 type DocState struct {
-	ID        string
-	Content   string
-	Version   int64
-	Ops       []ot.Operation // 版本号从1开始，ops[0]对应version=1
-	mu        sync.Mutex
+	ID      string
+	Content string
+	Version int64
+	Ops     []ot.Operation // 版本号从1开始，ops[0]对应version=1
+	mu      sync.Mutex
 }
 
 // NewServer 创建服务端
@@ -215,9 +215,9 @@ func (s *Server) GetDocumentSnapshotByID(w http.ResponseWriter, r *http.Request,
 	state.mu.Unlock()
 
 	writeJSON(w, 200, map[string]interface{}{
-		"doc_id":   id,
-		"content":  content,
-		"version":  version,
+		"doc_id":  id,
+		"content": content,
+		"version": version,
 	})
 }
 
@@ -528,22 +528,137 @@ func (s *Server) sendInitMessage(client *ws.Client) {
 func (s *Server) handleMessage(client *ws.Client, msg ws.Message) {
 	switch msg.Type {
 	case ws.MsgCursorMove:
-		// 更新光标位置并广播
-		client.Position = msg.Position
+		// 更新光标/视口位置并广播（跟随者据此同步视野）
+		vp := ws.Viewport{
+			Position:        msg.Position,
+			ScrollTopRatio:  msg.ScrollTopRatio,
+			ScrollLeftRatio: msg.ScrollLeftRatio,
+			ViewportHeight:  msg.ViewportHeight,
+			ViewportWidth:   msg.ViewportWidth,
+		}
+		client.SetViewport(vp)
 
 		cursorMsg := ws.Message{
-			Type:     ws.MsgCursorMove,
-			DocID:    client.RoomID,
-			ClientID: client.ClientID,
-			Username: client.Username,
-			Position: msg.Position,
-			Color:    client.Color,
+			Type:            ws.MsgCursorMove,
+			DocID:           client.RoomID,
+			ClientID:        client.ClientID,
+			Username:        client.Username,
+			Position:        msg.Position,
+			Color:           client.Color,
+			ScrollTopRatio:  msg.ScrollTopRatio,
+			ScrollLeftRatio: msg.ScrollLeftRatio,
+			ViewportHeight:  msg.ViewportHeight,
+			ViewportWidth:   msg.ViewportWidth,
 		}
 		s.Hub.BroadcastCursors(client.RoomID, client.ClientID, cursorMsg)
 
 	case ws.MsgOp:
 		// 处理OT操作
 		s.handleOperation(client, msg)
+
+	case ws.MsgFollow:
+		s.handleFollow(client, msg)
+
+	case ws.MsgUnfollow:
+		s.handleUnfollow(client)
+	}
+}
+
+// handleFollow 处理跟随请求
+func (s *Server) handleFollow(client *ws.Client, msg ws.Message) {
+	change, err := s.Hub.StartFollow(client, msg.TargetID)
+	if err != nil {
+		s.sendError(client, followErrText(err))
+		return
+	}
+
+	// 1) 回复 follower：确认跟随 + 目标当前视野（立即对齐，不用等下一次移动）
+	vp := change.TargetViewport
+	active := true
+	client.SendMessage(ws.Message{
+		Type:            ws.MsgFollowState,
+		DocID:           client.RoomID,
+		TargetID:        change.Target.ClientID,
+		Username:        change.Target.Username,
+		Color:           change.Target.Color,
+		Active:          &active,
+		Position:        vp.Position,
+		ScrollTopRatio:  vp.ScrollTopRatio,
+		ScrollLeftRatio: vp.ScrollLeftRatio,
+		ViewportHeight:  vp.ViewportHeight,
+		ViewportWidth:   vp.ViewportWidth,
+	})
+
+	// 2) 通知新leader：跟随者列表变化
+	change.Target.SendMessage(ws.Message{
+		Type:      ws.MsgFollowersUpdate,
+		DocID:     client.RoomID,
+		Followers: wsToUserInfos(s.Hub.FollowersOf(change.Target)),
+	})
+
+	// 3) follower 原来在跟随别人：旧leader列表更新
+	if change.OldLeader != nil {
+		change.OldLeader.SendMessage(ws.Message{
+			Type:      ws.MsgFollowersUpdate,
+			DocID:     client.RoomID,
+			Followers: wsToUserInfos(change.OldLeaderFollowers),
+		})
+	}
+
+	// 4) follower 原来被跟随：打断跟随它的人并给出明确提示
+	stopMsg := ws.Message{
+		Type:     ws.MsgFollowStopped,
+		DocID:    client.RoomID,
+		TargetID: client.ClientID,
+		Username: client.Username,
+		Reason:   ws.FollowStopRetarget,
+	}
+	for _, c := range change.StoppedFollowers {
+		c.SendMessage(stopMsg)
+	}
+}
+
+// handleUnfollow 主动解除跟随
+func (s *Server) handleUnfollow(client *ws.Client) {
+	target, remaining := s.Hub.StopFollow(client)
+
+	active := false
+	client.SendMessage(ws.Message{
+		Type:   ws.MsgFollowState,
+		DocID:  client.RoomID,
+		Active: &active,
+	})
+	if target != nil {
+		target.SendMessage(ws.Message{
+			Type:      ws.MsgFollowersUpdate,
+			DocID:     client.RoomID,
+			Followers: wsToUserInfos(remaining),
+		})
+	}
+}
+
+func wsToUserInfos(clients []*ws.Client) []ws.UserInfo {
+	users := make([]ws.UserInfo, 0, len(clients))
+	for _, c := range clients {
+		users = append(users, ws.UserInfo{
+			ClientID: c.ClientID,
+			Username: c.Username,
+			Color:    c.Color,
+		})
+	}
+	return users
+}
+
+func followErrText(err error) string {
+	switch err {
+	case ws.ErrFollowSelf:
+		return "不能跟随自己"
+	case ws.ErrFollowNotFound:
+		return "该用户已不在线，无法跟随"
+	case ws.ErrFollowChain:
+		return "对方正在跟随别人，暂不能跟随"
+	default:
+		return err.Error()
 	}
 }
 
