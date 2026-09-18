@@ -151,6 +151,91 @@
     align-items: center;
     gap: 6px;
   }
+
+  /* ===== 跟随功能 ===== */
+  .follow-bar {
+    background: #4361ee;
+    color: white;
+    padding: 8px 24px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .follow-bar b { font-weight: 600; }
+  .unfollow-btn {
+    background: rgba(255,255,255,0.2);
+    color: white;
+    border: 1px solid rgba(255,255,255,0.5);
+    padding: 4px 14px;
+    border-radius: 14px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .unfollow-btn:hover { background: rgba(255,255,255,0.35); }
+
+  .follower-badge {
+    background: #fff3cd;
+    color: #856404;
+    border: 1px solid #ffeeba;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+  }
+
+  .follow-btn {
+    margin-left: auto;
+    border: 1px solid #d0d5dd;
+    background: #f8f9fb;
+    color: #4361ee;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .follow-btn:hover { background: #4361ee; color: white; }
+  .follow-btn.active {
+    background: #4361ee;
+    color: white;
+    border-color: #4361ee;
+  }
+
+  /* 被跟随者的光标高亮 */
+  .remote-cursor.followed {
+    width: 3px;
+    box-shadow: 0 0 6px 1px currentColor;
+    z-index: 11;
+  }
+  .remote-cursor.followed .remote-cursor-label {
+    animation: followPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes followPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+
+  .toast {
+    position: fixed;
+    top: 64px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-16px);
+    background: #1a1a2e;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s, transform 0.25s;
+    z-index: 100;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 </style>
 </head>
 <body>
@@ -161,10 +246,16 @@
     <div class="doc-title" id="docTitle">加载中...</div>
   </div>
   <div class="toolbar-right">
+    <span class="follower-badge" id="followerBadge" style="display:none">👀 <span id="followerNum">0</span> 人正在跟随你</span>
     <div class="version-badge">v<span id="version">0</span></div>
     <div class="status-indicator" id="status"></div>
     <span id="statusText">连接中...</span>
   </div>
+</div>
+
+<div class="follow-bar" id="followBar" style="display:none">
+  <span>👁 正在跟随 <b id="followName"></b> —— 视图将同步对方的滚动和光标，你自己滚动不会打断跟随</span>
+  <button class="unfollow-btn" onclick="unfollow()">退出跟随</button>
 </div>
 
 <div class="editor-wrapper">
@@ -176,10 +267,13 @@
     <h3 style="margin-top:24px;">协作提示</h3>
     <p>👋 多人可以同时编辑此文档</p>
     <p>🎨 不同颜色代表不同用户的光标位置</p>
+    <p>👁 点击用户右侧「跟随」可实时同步对方视野，适合演示讲解</p>
     <p>💾 所有更改自动保存到服务器</p>
     <p>🔄 支持版本历史和回滚</p>
   </div>
 </div>
+
+<div class="toast" id="toast"></div>
 
 <div class="footer-bar">
   <div class="user-count">
@@ -206,6 +300,9 @@ let state = {
   reconnectAttempts: 0,
   pendingOps: [],   // 本地已发送但未ack的操作
   sendTimer: null,
+  // 跟随状态：targetId 已确认的跟随目标，pendingId 等待ack的目标
+  follow: { targetId: null, targetName: '', pendingId: null, savedView: null },
+  followerCount: 0, // 正在跟随我的人数（>0 时才上报自己的视野）
 };
 
 const editor = document.getElementById('editor');
@@ -227,7 +324,7 @@ async function init() {
   editor.addEventListener('input', onInput);
   editor.addEventListener('keyup', onCursorMove);
   editor.addEventListener('mouseup', onCursorMove);
-  editor.addEventListener('scroll', renderCursors);
+  editor.addEventListener('scroll', onEditorScroll);
   window.addEventListener('resize', renderCursors);
 }
 
@@ -306,8 +403,26 @@ function onMessage(event) {
       case 'user_leave':
         handleUserLeave(msg);
         break;
+      case 'viewport':
+        handleViewport(msg);
+        break;
+      case 'follow_ack':
+        handleFollowAck(msg);
+        break;
+      case 'follow_end':
+        handleFollowEnd(msg);
+        break;
+      case 'follow_info':
+        handleFollowInfo(msg);
+        break;
       case 'error':
         console.error('服务器错误:', msg.error);
+        // 跟随请求被拒绝（如目标刚离开），清理待定的跟随状态
+        if (state.follow.pendingId) {
+          clearFollowState();
+          updateFollowUI();
+          showToast('跟随失败：' + (msg.error || '对方已离开'));
+        }
         break;
     }
   } catch (e) {
@@ -316,6 +431,14 @@ function onMessage(event) {
 }
 
 function handleInit(msg) {
+  // 重连后会拿到新的 client_id，旧的跟随关系在服务端已失效
+  if (state.follow.targetId || state.follow.pendingId) {
+    showToast('连接已重置，跟随已结束');
+  }
+  clearFollowState();
+  state.followerCount = 0;
+  updateFollowUI();
+
   state.clientId = msg.client_id;
   state.color = msg.color;
   
@@ -397,18 +520,29 @@ function handleUserJoin(msg) {
 function handleUserLeave(msg) {
   state.users = state.users.filter(u => u.client_id !== msg.client_id);
   delete state.remoteCursors[msg.client_id];
+  // 兜底：若被跟随者离开（正常会先收到 follow_end，此处幂等）
+  if (state.follow.targetId === msg.client_id || state.follow.pendingId === msg.client_id) {
+    clearFollowState(); // 不恢复位置：视图停留在最后位置
+    updateFollowUI();
+    showToast(`${msg.username} 已离开，跟随结束，视图停留在最后位置`);
+  }
   renderUsers();
   renderCursors();
 }
 
 // ========== 用户列表渲染 ==========
 function renderUsers() {
-  usersPanel.innerHTML = state.users.map(u => `
+  usersPanel.innerHTML = state.users.map(u => {
+    const isFollowing = state.follow.targetId === u.client_id || state.follow.pendingId === u.client_id;
+    return `
     <div class="user-chip" style="border-color:${u.color}">
       <div class="dot" style="background:${u.color}"></div>
       ${escapeHtml(u.username)}
-    </div>
-  `).join('');
+      <button class="follow-btn ${isFollowing ? 'active' : ''}" onclick="toggleFollow('${u.client_id}')">
+        ${isFollowing ? '跟随中' : '跟随'}
+      </button>
+    </div>`;
+  }).join('');
   userCount.textContent = state.users.length + 1; // +1 自己
 }
 
@@ -426,6 +560,10 @@ function renderCursors() {
     
     const el = document.createElement('div');
     el.className = 'remote-cursor';
+    if (cursor.client_id === state.follow.targetId) {
+      el.classList.add('followed'); // 高亮被跟随者的光标
+      el.style.color = cursor.color;
+    }
     el.style.background = cursor.color;
     el.style.top = posInfo.top + 'px';
     el.style.left = posInfo.left + 'px';
@@ -512,6 +650,12 @@ function onCursorMove() {
   state.cursorPosition = editor.selectionStart;
   sendCursorPosition(state.cursorPosition);
   renderCursors();
+  maybeSendViewport();
+}
+
+function onEditorScroll() {
+  renderCursors();
+  maybeSendViewport();
 }
 
 function diffContent(oldContent, newContent) {
@@ -636,13 +780,172 @@ function sendOp(op, baseVersion) {
 
 function sendCursorPosition(pos) {
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-  
+
   const msg = {
     type: 'cursor_move',
     doc_id: docId,
     position: pos
   };
   state.ws.send(JSON.stringify(msg));
+}
+
+// ========== 跟随功能 ==========
+// 视野上报：仅当有人跟随我时才发送，80ms 节流
+let viewportTimer = null;
+function maybeSendViewport() {
+  if (state.followerCount === 0) return;
+  if (viewportTimer) return;
+  viewportTimer = setTimeout(() => {
+    viewportTimer = null;
+    sendViewport();
+  }, 80);
+}
+
+function sendViewport() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (state.followerCount === 0) return;
+  state.ws.send(JSON.stringify({
+    type: 'viewport',
+    doc_id: docId,
+    position: editor.selectionStart,
+    scroll_top: editor.scrollTop,
+    scroll_left: editor.scrollLeft
+  }));
+}
+
+// 点击用户旁的跟随按钮：跟随 / 取消跟随
+function toggleFollow(clientId) {
+  if (state.follow.targetId === clientId || state.follow.pendingId === clientId) {
+    unfollow();
+  } else {
+    startFollow(clientId);
+  }
+}
+
+function startFollow(targetId) {
+  const target = state.users.find(u => u.client_id === targetId);
+  if (!target) return;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    showToast('连接未就绪，无法跟随');
+    return;
+  }
+
+  // 仅在未跟随状态时记录自己的位置，供主动解除跟随后恢复
+  //（换跟随目标时保留最初的位置）
+  if (!state.follow.targetId && !state.follow.pendingId) {
+    state.follow.savedView = {
+      scrollTop: editor.scrollTop,
+      scrollLeft: editor.scrollLeft,
+      cursor: editor.selectionStart
+    };
+  }
+  state.follow.pendingId = targetId;
+  state.follow.targetName = target.username;
+  state.ws.send(JSON.stringify({ type: 'follow', doc_id: docId, target_id: targetId }));
+  updateFollowUI();
+  renderUsers();
+}
+
+// 主动解除跟随：回到自己原来的位置
+function unfollow() {
+  if (!state.follow.targetId && !state.follow.pendingId) return;
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: 'unfollow', doc_id: docId }));
+  }
+  const saved = state.follow.savedView;
+  clearFollowState();
+  if (saved) {
+    editor.scrollTop = saved.scrollTop;
+    editor.scrollLeft = saved.scrollLeft;
+    editor.setSelectionRange(saved.cursor, saved.cursor);
+  }
+  updateFollowUI();
+  renderUsers();
+  showToast('已退出跟随，回到你原来的位置');
+}
+
+function clearFollowState() {
+  state.follow.targetId = null;
+  state.follow.pendingId = null;
+  state.follow.savedView = null;
+  state.follow.targetName = '';
+}
+
+// 跟随确认：立即对齐到被跟随者当前视野
+function handleFollowAck(msg) {
+  state.follow.targetId = msg.target_id;
+  state.follow.pendingId = null;
+  state.follow.targetName = msg.username;
+  applyViewport(msg.target_id, msg);
+  updateFollowUI();
+  renderUsers();
+  showToast(`正在跟随 ${msg.username}`);
+}
+
+// 收到被跟随者的视野更新：同步滚动位置和光标
+function handleViewport(msg) {
+  if (msg.client_id !== state.follow.targetId) return;
+  applyViewport(msg.client_id, msg);
+}
+
+// 应用视野：所有跟随者应用同样的值，因此看到同样的画面
+function applyViewport(targetId, msg) {
+  state.remoteCursors[targetId] = {
+    client_id: targetId,
+    username: msg.username,
+    position: msg.position || 0,
+    color: msg.color
+  };
+  if (msg.scroll_top !== undefined) editor.scrollTop = msg.scroll_top;
+  if (msg.scroll_left !== undefined) editor.scrollLeft = msg.scroll_left;
+  renderCursors();
+}
+
+// 被跟随者断线/退出：提示并停在最后位置（不恢复原位置）
+function handleFollowEnd(msg) {
+  if (state.follow.targetId !== msg.target_id && state.follow.pendingId !== msg.target_id) return;
+  clearFollowState();
+  updateFollowUI();
+  renderUsers();
+  showToast(`${msg.username} 已离开，跟随结束，视图停留在最后位置`);
+}
+
+// 自己的跟随者人数变化
+function handleFollowInfo(msg) {
+  state.followerCount = msg.followers || 0;
+  updateFollowUI();
+}
+
+function updateFollowUI() {
+  const bar = document.getElementById('followBar');
+  const nameEl = document.getElementById('followName');
+  const badge = document.getElementById('followerBadge');
+
+  if (state.follow.targetId) {
+    bar.style.display = 'flex';
+    nameEl.textContent = state.follow.targetName;
+  } else if (state.follow.pendingId) {
+    bar.style.display = 'flex';
+    nameEl.textContent = state.follow.targetName + '（连接中…）';
+  } else {
+    bar.style.display = 'none';
+  }
+
+  if (state.followerCount > 0) {
+    badge.style.display = 'inline-block';
+    document.getElementById('followerNum').textContent = state.followerCount;
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+let toastTimer = null;
+function showToast(text) {
+  const toast = document.getElementById('toast');
+  toast.textContent = text;
+  toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
 }
 
 function escapeHtml(s) {

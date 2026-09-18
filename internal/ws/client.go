@@ -70,7 +70,7 @@ func (c *Client) ReadPump(opHandler func(*Client, Message)) {
 		msg.ClientID = c.ClientID
 
 		switch msg.Type {
-		case MsgOp, MsgCursorMove, MsgSnapshot:
+		case MsgOp, MsgCursorMove, MsgSnapshot, MsgFollow, MsgUnfollow, MsgViewport:
 			// 交给handler处理
 			if opHandler != nil {
 				opHandler(c, msg)

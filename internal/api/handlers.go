@@ -541,10 +541,93 @@ func (s *Server) handleMessage(client *ws.Client, msg ws.Message) {
 		}
 		s.Hub.BroadcastCursors(client.RoomID, client.ClientID, cursorMsg)
 
+	case ws.MsgViewport:
+		// 被跟随者上报视野（滚动位置+光标），只转发给跟随者
+		client.Position = msg.Position
+		client.ScrollTop = msg.ScrollTop
+		client.ScrollLeft = msg.ScrollLeft
+
+		s.Hub.BroadcastToFollowers(client.RoomID, client.ClientID, ws.Message{
+			Type:       ws.MsgViewport,
+			DocID:      client.RoomID,
+			ClientID:   client.ClientID,
+			Username:   client.Username,
+			Color:      client.Color,
+			Position:   msg.Position,
+			ScrollTop:  msg.ScrollTop,
+			ScrollLeft: msg.ScrollLeft,
+		})
+
+	case ws.MsgFollow:
+		s.handleFollow(client, msg)
+
+	case ws.MsgUnfollow:
+		s.handleUnfollow(client)
+
 	case ws.MsgOp:
 		// 处理OT操作
 		s.handleOperation(client, msg)
 	}
+}
+
+// handleFollow 建立跟随关系，回执中附带被跟随者当前视野快照
+func (s *Server) handleFollow(client *ws.Client, msg ws.Message) {
+	target, oldTargetID, followers, err := s.Hub.SetFollow(client.RoomID, client.ClientID, msg.TargetID)
+	if err != nil {
+		s.sendError(client, err.Error())
+		return
+	}
+
+	log.Printf("[Follow] %s(%s) starts following %s(%s) in room %s",
+		client.Username, client.ClientID, target.Username, target.ClientID, client.RoomID)
+
+	// 回执：让跟随者立即对齐到被跟随者当前视野
+	client.SendMessage(ws.Message{
+		Type:       ws.MsgFollowAck,
+		DocID:      client.RoomID,
+		ClientID:   client.ClientID,
+		TargetID:   target.ClientID,
+		Username:   target.Username,
+		Color:      target.Color,
+		Position:   target.Position,
+		ScrollTop:  target.ScrollTop,
+		ScrollLeft: target.ScrollLeft,
+		Followers:  followers,
+	})
+
+	// 通知被跟随者跟随人数变化
+	target.SendMessage(ws.Message{
+		Type:      ws.MsgFollowInfo,
+		DocID:     client.RoomID,
+		ClientID:  target.ClientID,
+		Followers: followers,
+	})
+
+	// 换跟随目标时，通知旧目标更新跟随人数
+	if oldTargetID != "" && oldTargetID != target.ClientID {
+		s.notifyFollowerCount(client.RoomID, oldTargetID)
+	}
+}
+
+// handleUnfollow 解除跟随关系
+func (s *Server) handleUnfollow(client *ws.Client) {
+	targetID, ok := s.Hub.RemoveFollow(client.RoomID, client.ClientID)
+	if !ok {
+		return
+	}
+	log.Printf("[Follow] %s(%s) stopped following %s in room %s",
+		client.Username, client.ClientID, targetID, client.RoomID)
+	s.notifyFollowerCount(client.RoomID, targetID)
+}
+
+// notifyFollowerCount 通知被跟随者当前跟随人数
+func (s *Server) notifyFollowerCount(roomID, targetID string) {
+	s.Hub.SendToClient(roomID, targetID, ws.Message{
+		Type:      ws.MsgFollowInfo,
+		DocID:     roomID,
+		ClientID:  targetID,
+		Followers: s.Hub.FollowerCount(roomID, targetID),
+	})
 }
 
 // handleOperation 核心OT操作处理
