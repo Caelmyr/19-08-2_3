@@ -1,0 +1,12 @@
+server
+*.exe
+*.test
+*.prof
+.git
+.gitignore
+node_modules
+vendor
+dist
+doker.txt
+zhiling.txt
+验收.txt

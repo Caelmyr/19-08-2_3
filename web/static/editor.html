@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoEdit - 协作编辑器</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f7fa;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  
+  .toolbar {
+    background: white;
+    padding: 12px 24px;
+    border-bottom: 1px solid #e8ecf1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .toolbar-left { display: flex; align-items: center; gap: 16px; }
+  .toolbar-right { display: flex; align-items: center; gap: 12px; }
+  .back-btn {
+    color: #666;
+    text-decoration: none;
+    font-size: 14px;
+  }
+  .back-btn:hover { color: #4361ee; }
+  .doc-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: #1a1a2e;
+  }
+  .version-badge {
+    background: #e8ecf1;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    color: #666;
+  }
+  .status-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #999;
+    display: inline-block;
+    margin-right: 6px;
+  }
+  .status-indicator.connected { background: #2ecc71; }
+  .status-indicator.disconnected { background: #e74c3c; }
+  
+  .users-panel {
+    display: flex;
+    gap: 8px;
+  }
+  .user-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 16px;
+    font-size: 12px;
+    background: white;
+    border: 2px solid;
+  }
+  .user-chip .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  
+  .editor-wrapper {
+    flex: 1;
+    display: flex;
+    position: relative;
+    overflow: hidden;
+  }
+  
+  .cursors-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  .remote-cursor {
+    position: absolute;
+    width: 2px;
+    transition: top 0.15s, left 0.15s;
+    z-index: 10;
+  }
+  .remote-cursor-label {
+    position: absolute;
+    top: -18px;
+    left: -1px;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: white;
+    white-space: nowrap;
+  }
+  
+  #editor {
+    width: 100%;
+    height: 100%;
+    padding: 32px 64px;
+    font-size: 16px;
+    line-height: 1.7;
+    border: none;
+    outline: none;
+    resize: none;
+    font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+    background: white;
+  }
+  
+  .sidebar {
+    width: 240px;
+    background: white;
+    border-left: 1px solid #e8ecf1;
+    padding: 16px;
+    overflow-y: auto;
+  }
+  .sidebar h3 {
+    font-size: 14px;
+    color: #666;
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .sidebar p {
+    font-size: 12px;
+    color: #999;
+    line-height: 1.6;
+    margin-bottom: 8px;
+  }
+  
+  .footer-bar {
+    background: white;
+    padding: 8px 24px;
+    border-top: 1px solid #e8ecf1;
+    font-size: 12px;
+    color: #999;
+    display: flex;
+    justify-content: space-between;
+  }
+  
+  .user-count {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <div class="toolbar-left">
+    <a href="/" class="back-btn">← 返回文档列表</a>
+    <div class="doc-title" id="docTitle">加载中...</div>
+  </div>
+  <div class="toolbar-right">
+    <div class="version-badge">v<span id="version">0</span></div>
+    <div class="status-indicator" id="status"></div>
+    <span id="statusText">连接中...</span>
+  </div>
+</div>
+
+<div class="editor-wrapper">
+  <div class="cursors-layer" id="cursorsLayer"></div>
+  <textarea id="editor" spellcheck="false" placeholder="开始输入..."></textarea>
+  <div class="sidebar">
+    <h3>在线用户</h3>
+    <div class="users-panel" id="usersPanel"></div>
+    <h3 style="margin-top:24px;">协作提示</h3>
+    <p>👋 多人可以同时编辑此文档</p>
+    <p>🎨 不同颜色代表不同用户的光标位置</p>
+    <p>💾 所有更改自动保存到服务器</p>
+    <p>🔄 支持版本历史和回滚</p>
+  </div>
+</div>
+
+<div class="footer-bar">
+  <div class="user-count">
+    👥 在线: <span id="userCount">0</span> 人
+  </div>
+  <div>CoEdit OT 实时协作引擎</div>
+</div>
+
+<script>
+// ========== 状态管理 ==========
+const params = new URLSearchParams(window.location.search);
+const docId = params.get('doc_id');
+const username = params.get('username') || '用户-' + Math.random().toString(36).slice(2, 6);
+
+let state = {
+  content: '',
+  version: 0,
+  clientId: null,
+  color: '#4361ee',
+  cursorPosition: 0,
+  remoteCursors: {},
+  users: [],
+  ws: null,
+  reconnectAttempts: 0,
+  pendingOps: [],   // 本地已发送但未ack的操作
+  sendTimer: null,
+};
+
+const editor = document.getElementById('editor');
+const cursorsLayer = document.getElementById('cursorsLayer');
+const versionEl = document.getElementById('version');
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('statusText');
+const usersPanel = document.getElementById('usersPanel');
+const userCount = document.getElementById('userCount');
+const docTitle = document.getElementById('docTitle');
+
+// ========== 初始化 ==========
+async function init() {
+  // 加载文档
+  await loadDocument();
+  // 建立WebSocket连接
+  connectWS();
+  // 监听编辑事件
+  editor.addEventListener('input', onInput);
+  editor.addEventListener('keyup', onCursorMove);
+  editor.addEventListener('mouseup', onCursorMove);
+  editor.addEventListener('scroll', renderCursors);
+  window.addEventListener('resize', renderCursors);
+}
+
+async function loadDocument() {
+  try {
+    const res = await fetch(`/api/documents/${docId}/snapshot`);
+    const data = await res.json();
+    state.content = data.content || '';
+    state.version = data.version || 0;
+    editor.value = state.content;
+    versionEl.textContent = state.version;
+    
+    // 获取文档标题
+    const docRes = await fetch(`/api/documents/${docId}`);
+    const docData = await docRes.json();
+    docTitle.textContent = docData.title || '未命名文档';
+  } catch (e) {
+    console.error('加载文档失败:', e);
+  }
+}
+
+// ========== WebSocket ==========
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws?doc_id=${docId}&username=${encodeURIComponent(username)}`;
+  
+  state.ws = new WebSocket(url);
+  
+  state.ws.onopen = () => {
+    console.log('WebSocket 已连接');
+    statusEl.className = 'status-indicator connected';
+    statusText.textContent = '已连接';
+    state.reconnectAttempts = 0;
+  };
+  
+  state.ws.onclose = () => {
+    console.log('WebSocket 断开');
+    statusEl.className = 'status-indicator disconnected';
+    statusText.textContent = '重连中...';
+    // 自动重连
+    setTimeout(() => {
+      state.reconnectAttempts++;
+      if (state.reconnectAttempts < 10) {
+        connectWS();
+      }
+    }, Math.min(1000 * state.reconnectAttempts, 10000));
+  };
+  
+  state.ws.onerror = (e) => {
+    console.error('WebSocket 错误:', e);
+  };
+  
+  state.ws.onmessage = onMessage;
+}
+
+function onMessage(event) {
+  try {
+    const msg = JSON.parse(event.data);
+    
+    switch (msg.type) {
+      case 'init':
+        handleInit(msg);
+        break;
+      case 'op':
+        handleRemoteOp(msg);
+        break;
+      case 'ack':
+        handleAck(msg);
+        break;
+      case 'cursor_move':
+        handleCursorMove(msg);
+        break;
+      case 'user_join':
+        handleUserJoin(msg);
+        break;
+      case 'user_leave':
+        handleUserLeave(msg);
+        break;
+      case 'error':
+        console.error('服务器错误:', msg.error);
+        break;
+    }
+  } catch (e) {
+    console.error('解析消息失败:', e);
+  }
+}
+
+function handleInit(msg) {
+  state.clientId = msg.client_id;
+  state.color = msg.color;
+  
+  // 使用服务器的内容（可能比我们加载的更新）
+  if (msg.content !== undefined) {
+    state.content = msg.content;
+    editor.value = msg.content;
+  }
+  if (msg.version !== undefined) {
+    state.version = msg.version;
+    versionEl.textContent = msg.version;
+  }
+  
+  // 添加已有用户
+  if (msg.users) {
+    state.users = msg.users.filter(u => u.client_id !== state.clientId);
+    renderUsers();
+  }
+  
+  // 渲染已有光标
+  if (msg.cursors) {
+    msg.cursors.forEach(c => {
+      if (c.client_id !== state.clientId) {
+        state.remoteCursors[c.client_id] = { ...c };
+      }
+    });
+    renderCursors();
+  }
+  
+  console.log('初始化完成, clientId:', state.clientId, 'version:', state.version);
+}
+
+function handleRemoteOp(msg) {
+  // 接收来自其他客户端的操作
+  const op = msg.op;
+  console.log('收到远端op:', op, 'version:', msg.version);
+  
+  // 应用到本地
+  applyOpToEditor(op);
+  
+  state.version = msg.version;
+  versionEl.textContent = state.version;
+}
+
+function handleAck(msg) {
+  // 服务器确认我们的操作
+  console.log('收到ack, version:', msg.version);
+  state.version = msg.version;
+  versionEl.textContent = msg.version;
+  // 清除对应的pang操作
+  state.pendingOps = state.pendingOps.filter(o => o.version !== msg.version);
+}
+
+function handleCursorMove(msg) {
+  if (msg.client_id === state.clientId) return;
+  
+  state.remoteCursors[msg.client_id] = {
+    client_id: msg.client_id,
+    username: msg.username,
+    position: msg.position,
+    color: msg.color
+  };
+  renderCursors();
+}
+
+function handleUserJoin(msg) {
+  if (msg.client_id === state.clientId) return;
+  
+  if (!state.users.find(u => u.client_id === msg.client_id)) {
+    state.users.push({
+      client_id: msg.client_id,
+      username: msg.username,
+      color: msg.color
+    });
+  }
+  renderUsers();
+}
+
+function handleUserLeave(msg) {
+  state.users = state.users.filter(u => u.client_id !== msg.client_id);
+  delete state.remoteCursors[msg.client_id];
+  renderUsers();
+  renderCursors();
+}
+
+// ========== 用户列表渲染 ==========
+function renderUsers() {
+  usersPanel.innerHTML = state.users.map(u => `
+    <div class="user-chip" style="border-color:${u.color}">
+      <div class="dot" style="background:${u.color}"></div>
+      ${escapeHtml(u.username)}
+    </div>
+  `).join('');
+  userCount.textContent = state.users.length + 1; // +1 自己
+}
+
+// ========== 光标渲染 ==========
+function renderCursors() {
+  // 清空
+  cursorsLayer.innerHTML = '';
+  
+  Object.values(state.remoteCursors).forEach(cursor => {
+    const pos = cursor.position;
+    if (pos < 0 || pos > editor.value.length) return;
+    
+    // 计算位置（简化：按字符位置计算）
+    const posInfo = getCaretCoordinates(editor, pos);
+    
+    const el = document.createElement('div');
+    el.className = 'remote-cursor';
+    el.style.background = cursor.color;
+    el.style.top = posInfo.top + 'px';
+    el.style.left = posInfo.left + 'px';
+    el.style.height = posInfo.height + 'px';
+    
+    const label = document.createElement('div');
+    label.className = 'remote-cursor-label';
+    label.style.background = cursor.color;
+    label.textContent = cursor.username;
+    el.appendChild(label);
+    
+    cursorsLayer.appendChild(el);
+  });
+}
+
+// 获取光标在textarea中的像素位置
+function getCaretCoordinates(element, position) {
+  // 创建一个镜像元素来计算位置
+  const mirror = document.createElement('div');
+  const style = window.getComputedStyle(element);
+  
+  // 复制样式
+  const props = ['boxSizing', 'width', 'height', 'overflowX', 'overflowY',
+    'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+    'borderStyle', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'fontStyle', 'fontVariant', 'fontWeight', 'fontStretch', 'fontSize',
+    'fontSizeAdjust', 'lineHeight', 'fontFamily',
+    'textAlign', 'textTransform', 'textIndent', 'textDecoration',
+    'letterSpacing', 'wordSpacing', 'tabSize'];
+  
+  props.forEach(p => {
+    mirror.style[p] = style[p];
+  });
+  
+  mirror.style.position = 'absolute';
+  mirror.style.top = '0';
+  mirror.style.left = '0';
+  mirror.style.visibility = 'hidden';
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.wordWrap = 'break-word';
+  
+  // 设置内容
+  const text = element.value.substring(0, position);
+  const afterText = element.value.substring(position);
+  mirror.textContent = text;
+  
+  const span = document.createElement('span');
+  span.textContent = afterText || '.';
+  mirror.appendChild(span);
+  
+  document.body.appendChild(mirror);
+  
+  const rect = element.getBoundingClientRect();
+  const mirrorRect = mirror.getBoundingClientRect();
+  const spanRect = span.getBoundingClientRect();
+  
+  document.body.removeChild(mirror);
+  
+  return {
+    top: spanRect.top - mirrorRect.top - element.scrollTop,
+    left: spanRect.left - mirrorRect.left - element.scrollLeft,
+    height: parseInt(style.lineHeight) || parseInt(style.fontSize) * 1.2,
+    width: 2
+  };
+}
+
+// ========== 编辑器操作 ==========
+function onInput(e) {
+  // 计算差异，发送OT操作
+  const newContent = editor.value;
+  const oldContent = state.content;
+  
+  if (newContent === oldContent) return;
+  
+  const op = diffContent(oldContent, newContent);
+  if (!op) return;
+  
+  // 发送操作（带base_version）
+  sendOp(op, state.version);
+  state.content = newContent;
+}
+
+function onCursorMove() {
+  state.cursorPosition = editor.selectionStart;
+  sendCursorPosition(state.cursorPosition);
+  renderCursors();
+}
+
+function diffContent(oldContent, newContent) {
+  // 简单的差异计算
+  if (newContent.length > oldContent.length) {
+    // 插入
+    let diffStart = 0;
+    while (diffStart < oldContent.length && diffStart < newContent.length) {
+      if (oldContent[diffStart] !== newContent[diffStart]) break;
+      diffStart++;
+    }
+    let diffEndOld = oldContent.length;
+    let diffEndNew = newContent.length;
+    while (diffEndOld > diffStart && diffEndNew > diffStart) {
+      if (oldContent[diffEndOld - 1] !== newContent[diffEndNew - 1]) break;
+      diffEndOld--;
+      diffEndNew--;
+    }
+    
+    // 在公共前缀之后有删除+插入
+    const deletedText = oldContent.substring(diffStart, diffEndOld);
+    const insertedText = newContent.substring(diffStart, diffEndNew);
+    
+    if (deletedText.length > 0) {
+      return {
+        operations: [
+          { type: 'delete', position: diffStart, length: deletedText.length },
+          { type: 'insert', position: diffStart, text: insertedText }
+        ]
+      };
+    } else {
+      return {
+        operations: [
+          { type: 'insert', position: diffStart, text: insertedText }
+        ]
+      };
+    }
+  } else if (newContent.length < oldContent.length) {
+    // 删除
+    let diffStart = 0;
+    while (diffStart < oldContent.length && diffStart < newContent.length) {
+      if (oldContent[diffStart] !== newContent[diffStart]) break;
+      diffStart++;
+    }
+    
+    let diffEndOld = oldContent.length;
+    let diffEndNew = newContent.length;
+    while (diffEndOld > diffStart && diffEndNew > diffStart) {
+      if (oldContent[diffEndOld - 1] !== newContent[diffEndNew - 1]) break;
+      diffEndOld--;
+      diffEndNew--;
+    }
+    
+    const deletedText = oldContent.substring(diffStart, diffEndOld);
+    const insertedText = newContent.substring(diffStart, diffEndNew);
+    
+    if (insertedText.length > 0) {
+      return {
+        operations: [
+          { type: 'delete', position: diffStart, length: deletedText.length },
+          { type: 'insert', position: diffStart, text: insertedText }
+        ]
+      };
+    } else {
+      return {
+        operations: [
+          { type: 'delete', position: diffStart, length: deletedText.length }
+        ]
+      };
+    }
+  }
+  return null;
+}
+
+function applyOpToEditor(op) {
+  const operations = op.operations || [op];
+  
+  operations.forEach(o => {
+    if (o.type === 'insert') {
+      insertText(o.position, o.text);
+    } else if (o.type === 'delete') {
+      deleteText(o.position, o.length);
+    }
+  });
+  
+  state.content = editor.value;
+}
+
+function insertText(pos, text) {
+  const before = editor.value.substring(0, pos);
+  const after = editor.value.substring(pos);
+  editor.value = before + text + after;
+}
+
+function deleteText(pos, length) {
+  const before = editor.value.substring(0, pos);
+  const after = editor.value.substring(pos + length);
+  editor.value = before + after;
+}
+
+function sendOp(op, baseVersion) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  
+  const msg = {
+    type: 'op',
+    doc_id: docId,
+    op: op.operations && op.operations.length === 1 ? op.operations[0] : op,
+    base_version: baseVersion,
+    version: baseVersion
+  };
+  
+  // 如果是多操作序列，逐个发送
+  if (op.operations && op.operations.length > 1) {
+    op.operations.forEach((singleOp, i) => {
+      const singleMsg = { ...msg, op: singleOp };
+      state.ws.send(JSON.stringify(singleMsg));
+    });
+  } else {
+    state.ws.send(JSON.stringify(msg));
+  }
+}
+
+function sendCursorPosition(pos) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  
+  const msg = {
+    type: 'cursor_move',
+    doc_id: docId,
+    position: pos
+  };
+  state.ws.send(JSON.stringify(msg));
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+// 启动
+init();
+</script>
+</body>
+</html>

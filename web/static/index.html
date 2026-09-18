@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoEdit - 多人协作文档编辑</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f7fa;
+    color: #333;
+    min-height: 100vh;
+  }
+  .container { max-width: 1000px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 28px; margin-bottom: 8px; color: #1a1a2e; }
+  .subtitle { color: #666; margin-bottom: 32px; }
+  
+  .card {
+    background: white;
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+  }
+  .card-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: #1a1a2e;
+  }
+  .card-meta {
+    font-size: 13px;
+    color: #999;
+  }
+  .card-actions { margin-top: 16px; display: flex; gap: 8px; }
+  
+  .btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.2s;
+  }
+  .btn-primary {
+    background: #4361ee;
+    color: white;
+  }
+  .btn-primary:hover { background: #3a56d4; }
+  .btn-secondary {
+    background: #e8ecf1;
+    color: #333;
+  }
+  .btn-secondary:hover { background: #d8dde3; }
+  .btn-danger {
+    background: #e74c3c;
+    color: white;
+  }
+  .btn-danger:hover { background: #c0392b; }
+  
+  .new-doc-form {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 32px;
+  }
+  .input {
+    flex: 1;
+    padding: 12px 16px;
+    border: 2px solid #e8ecf1;
+    border-radius: 8px;
+    font-size: 14px;
+    transition: border-color 0.2s;
+  }
+  .input:focus {
+    outline: none;
+    border-color: #4361ee;
+  }
+  
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #999;
+  }
+  .empty-state-icon { font-size: 48px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📝 CoEdit</h1>
+  <p class="subtitle">多人协作文档编辑服务 - 实时同步、冲突解决、版本历史</p>
+  
+  <div class="new-doc-form">
+    <input id="newTitle" class="input" type="text" placeholder="输入新文档标题...">
+    <button class="btn btn-primary" onclick="createDocument()">创建文档</button>
+  </div>
+  
+  <div id="docList"></div>
+</div>
+
+<script>
+async function loadDocuments() {
+  const res = await fetch('/api/documents');
+  const docs = await res.json();
+  const list = document.getElementById('docList');
+  
+  if (docs.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">📄</div>
+        <p>还没有文档，创建一个开始协作吧！</p>
+      </div>`;
+    return;
+  }
+  
+  list.innerHTML = docs.map(doc => `
+    <div class="card">
+      <div class="card-title">${escapeHtml(doc.title)}</div>
+      <div class="card-meta">
+        版本: ${doc.current_version} · 
+        更新时间: ${new Date(doc.updated_at).toLocaleString('zh-CN')}
+      </div>
+      <div class="card-actions">
+        <button class="btn btn-primary" onclick="window.location.href='/editor.html?doc_id=${doc.id}'">打开编辑器</button>
+        <button class="btn btn-secondary" onclick="showVersionHistory('${doc.id}')">版本历史</button>
+        <button class="btn btn-danger" onclick="deleteDocument('${doc.id}')">删除</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function createDocument() {
+  const title = document.getElementById('newTitle').value.trim() || '未命名文档';
+  const res = await fetch('/api/documents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title })
+  });
+  const doc = await res.json();
+  window.location.href = `/editor.html?doc_id=${doc.id}`;
+}
+
+async function deleteDocument(id) {
+  if (!confirm('确定删除这个文档吗？')) return;
+  await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+  loadDocuments();
+}
+
+function showVersionHistory(docId) {
+  const target = window.open('', '_blank');
+  target.location.href = `/versions.html?doc_id=${docId}`;
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+loadDocuments();
+</script>
+</body>
+</html>
